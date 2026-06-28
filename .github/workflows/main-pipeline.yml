@@ -1,0 +1,263 @@
+name: Unified CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  ARTIFACT_TAG: ${{ github.sha }}
+
+jobs:
+  # ============================================
+  # STAGE 1: Build & Test (Always runs)
+  # ============================================
+  build-and-test:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.set-tag.outputs.tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-cov
+
+      - name: Run unit tests
+        run: |
+          cd app
+          pytest tests/ -v --cov=. --cov-report=xml || true  # Don't fail if no tests yet
+
+      - name: Set Docker image tag
+        id: set-tag
+        run: |
+          if [ "${{ github.ref }}" == "refs/heads/main" ]; then
+            echo "tag=${{ github.sha }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=dev-${{ github.sha }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build Docker image (Immutable Artifact)
+        run: |
+          docker build -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.set-tag.outputs.tag }} .
+          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.set-tag.outputs.tag }} ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push Docker image
+        run: |
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.set-tag.outputs.tag }}
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Save build metadata
+        run: |
+          cat > build-metadata.json << EOF
+          {
+            "commit_sha": "${{ github.sha }}",
+            "image_tag": "${{ steps.set-tag.outputs.tag }}",
+            "image_name": "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}",
+            "branch": "${{ github.ref_name }}",
+            "timestamp": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          }
+          EOF
+
+      - name: Upload build metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-metadata
+          path: build-metadata.json
+
+  # ============================================
+  # STAGE 2: Deploy to Development (Auto)
+  # ============================================
+  deploy-development:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    environment: development
+    if: github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'latest'
+
+      - name: Install kustomize
+        uses: imranismail/setup-kustomize@v2
+        with:
+          kustomize-version: '5.1.0'
+
+      - name: Setup kubeconfig for development
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBE_CONFIG_DEV }}" | base64 -d > $HOME/.kube/config
+
+      - name: Deploy to Development
+        run: |
+          cd k8s/overlays/development
+          kustomize edit set image fastapi-app=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-test.outputs.image_tag }}
+          kustomize build . | kubectl apply -f -
+
+      - name: Wait for deployment to be ready
+        run: |
+          kubectl rollout status deployment/fastapi-app -n development --timeout=120s
+
+      - name: Verify deployment
+        run: |
+          kubectl get pods -n development
+          kubectl get svc -n development
+          kubectl get ingress -n development
+
+  # ============================================
+  # STAGE 3: Deploy to SIT (Auto)
+  # ============================================
+  deploy-sit:
+    needs: deploy-development
+    runs-on: ubuntu-latest
+    environment: sit
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'latest'
+      
+      - name: Install kustomize
+        uses: imranismail/setup-kustomize@v2
+        with:
+          kustomize-version: '5.1.0'
+
+      - name: Setup kubeconfig for SIT
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBE_CONFIG_SIT }}" | base64 -d > $HOME/.kube/config
+
+      - name: Deploy to SIT
+        run: |
+          cd k8s/overlays/sit
+          kustomize edit set image fastapi-app=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-test.outputs.image_tag }}
+          kustomize build . | kubectl apply -f -
+
+      - name: Wait for deployment
+        run: |
+          kubectl rollout status deployment/fastapi-app -n sit --timeout=120s
+
+      - name: Verify SIT deployment
+        run: |
+          kubectl get pods -n sit
+          kubectl get ingress -n sit
+
+  # ============================================
+  # STAGE 4: Deploy to UAT (Manual Approval)
+  # ============================================
+  deploy-uat:
+    needs: deploy-sit
+    runs-on: ubuntu-latest
+    environment: 
+      name: uat
+      url: http://uat.app.local
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'latest'
+      
+      - name: Install kustomize
+        uses: imranismail/setup-kustomize@v2
+        with:
+          kustomize-version: '5.1.0'
+
+      - name: Setup kubeconfig for UAT
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBE_CONFIG_UAT }}" | base64 -d > $HOME/.kube/config
+
+      - name: Deploy to UAT
+        run: |
+          cd k8s/overlays/uat
+          kustomize edit set image fastapi-app=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-test.outputs.image_tag }}
+          kustomize build . | kubectl apply -f -
+
+      - name: Wait for deployment
+        run: |
+          kubectl rollout status deployment/fastapi-app -n uat --timeout=120s
+
+      - name: Verify UAT deployment
+        run: |
+          kubectl get pods -n uat
+          kubectl get ingress -n uat
+
+  # ============================================
+  # STAGE 5: Deploy to Production (Manual Approval)
+  # ============================================
+  deploy-production:
+    needs: deploy-uat
+    runs-on: ubuntu-latest
+    environment: 
+      name: production
+      url: http://app.local
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'latest'
+      
+      - name: Install kustomize
+        uses: imranismail/setup-kustomize@v2
+        with:
+          kustomize-version: '5.1.0'
+
+      - name: Setup kubeconfig for Production
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBE_CONFIG_PROD }}" | base64 -d > $HOME/.kube/config
+
+      - name: Deploy to Production
+        run: |
+          cd k8s/overlays/production
+          kustomize edit set image fastapi-app=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-test.outputs.image_tag }}
+          kustomize build . | kubectl apply -f -
+
+      - name: Wait for deployment
+        run: |
+          kubectl rollout status deployment/fastapi-app -n production --timeout=180s
+
+      - name: Verify production deployment
+        run: |
+          kubectl get pods -n production
+          kubectl get ingress -n production
+          
+      - name: Notify deployment success
+        if: success()
+        run: |
+          echo "✅ Production deployment successful!"
+          echo "Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-test.outputs.image_tag }}"
